@@ -1,0 +1,37 @@
+column
+Организация
+Критичность
+Пиктограмма IRP
+Источник инцидента
+Информация о вовлеченных активах
+Легитимность действия
+Вендор из сием
+dst
+src
+Hostname атакующего
+Hostname Цели
+suser
+object
+CMDLINE
+duser
+objectLinks
+processName
+processParentName
+processPath
+Команда
+Цепочка процессов
+Значение Инцидента (группировка по типу)
+Дата создания в источнике
+Время первого события
+Время последнего события
+Значение Инцидента (группировка)
+Правило корреляции SIEM
+Статус инцидента из SIEM
+commandName
+objectValue
+Количество событий
+processParentPath
+object.name
+fileName
+filePath
+Права администратора

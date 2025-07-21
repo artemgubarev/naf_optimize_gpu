@@ -1,6 +1,6 @@
 import numpy as np
-from .base import AttentionForest
-from .forests import FORESTS, ForestKind, ForestType, TaskType
+from base import AttentionForest
+from forests import FORESTS, ForestKind, ForestType, TaskType
 from typing import Optional, Tuple, Union, Callable
 from dataclasses import InitVar, dataclass, field
 import logging
@@ -10,7 +10,7 @@ import time
 from numba import njit
 from tqdm import tqdm, trange
 import torch
-from .naf_nn import NAFNetwork
+from naf_nn import NAFNetwork
 from sklearn.utils.validation import check_random_state
 
 from torch.utils.data import TensorDataset, DataLoader

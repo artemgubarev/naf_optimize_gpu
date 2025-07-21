@@ -2,7 +2,7 @@ import logging
 import numpy as np
 from abc import ABC, abstractmethod
 from typing import NamedTuple, Optional, Tuple
-from .forests import *
+from forests import *
 from time import time
 from sklearn.preprocessing import OneHotEncoder
 
