@@ -1,13 +1,13 @@
 import numpy as np
-from .base import AttentionForest
-from .forests import FORESTS, ForestKind, ForestType, TaskType
+from base import AttentionForest
+from forests import FORESTS, ForestKind, ForestType, TaskType
 from typing import Optional, Tuple, Union, Callable
 from dataclasses import InitVar, dataclass, field
 import logging
 from time import time
 from numba import njit
 import torch
-from .naf_nn import NAFNetwork
+from naf_nn import NAFNetwork
 from sklearn.utils.validation import check_random_state
 
 from IPython.core.debugger import set_trace
@@ -353,3 +353,6 @@ class NeuralAttentionForest(AttentionForest):
             return predictions
         else:
             return predictions, X_reconstruction, alphas, betas
+        
+        
+    

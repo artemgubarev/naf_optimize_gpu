@@ -1,65 +1,50 @@
 import sys
-sys.path.append('NAF')
-sys.path.append('LARF')
-sys.path.append('LARF/wlarf/features')
-
 import os
+
+sys.path.append(os.path.abspath(os.path.join(os.getcwd(), '..', 'src')))
+sys.path.append(os.path.abspath(os.path.join(os.getcwd(), '..', 'src/features')))
+
 import re
 import pytz
+import torch
 import joblib
 import pandas as pd
 import numpy as np
-import wlarf
 import warnings
-import matplotlib.pyplot as plt
-warnings.filterwarnings("ignore")
+import naf_original
 
+from tqdm import tqdm
 from datetime import datetime
 
 from sklearn.metrics import fbeta_score
-from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, FunctionTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.decomposition import PCA
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import MinMaxScaler
-from IPython.core.debugger import set_trace
 
 from process_features import preprocess_data
-from naf.forests import ForestKind, TaskType
-from naf.naf_model import NeuralAttentionForest, NAFParams
-from naf import naf_original
+from forests import ForestKind, TaskType
+from naf_model import NeuralAttentionForest, NAFParams
 
-import torch
-from torch.profiler import profile, record_function, ProfilerActivity
+from IPython.core.debugger import set_trace
 
-
-
-
-# -------- data load ---------
+warnings.filterwarnings("ignore")
 
 print("⏳ data loading...")
 
-path = 'LARF/gsoc_incidents_raw3.parquet'
+path = '../../gsoc_incidents_raw3.parquet'
 df = pd.read_parquet(path)
-df['target'] = df['Вердикт'].apply(
-    lambda x: True if x == 'False Positive' else (pd.NA if x == 'Не указан' else False)
-)
+
+df['target'] = df['Вердикт'].apply( lambda x: True if x == 'False Positive' else (pd.NA if x == 'Не указан' else False))
 df = df[df['target'].notnull()]
 df['target'] = df['target'].astype(float)
-df = df[::2000]
+df = df[::1000]
 
 y = df['target'].astype(float).to_numpy()
 X = df.drop(columns=['target'])
 
-used_columns = pd.read_csv('LARF/wlarf/features/used_columns.csv')
+used_columns = pd.read_csv('../src/features/used_columns.csv')
 
 X = X[used_columns['column'].to_numpy()]
 X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
-X_train = preprocess_data(X_train, 'LARF/transform_data_pipeline.pkl')
+X_train = preprocess_data(X_train, '../data/transform_data_pipeline.pkl')
 
 print("✅ data loaded successfully...")
 
@@ -90,7 +75,8 @@ orig_model = naf_original.NeuralAttentionForest(params)
 print("⏳ gpu model fit...")
 model.fit(X_train, y_train)
 print("⏳ gpu model optimize weights...")
-model.optimize_weights(X_train, y_train)
+neighbors_hot = model.get_neighbors_hot(X_train)
+model.optimize_weights(X_train, y_train, neighbors_hot)
 
 print("⏳ original model fit...")
 orig_model.fit(X_train, y_train)
@@ -99,7 +85,7 @@ orig_model.optimize_weights(X_train, y_train)
 
 print("✅ all models fitted...")
 
-X_test = preprocess_data(X_test, 'LARF/transform_data_pipeline.pkl')
+X_test = preprocess_data(X_test, '../data/transform_data_pipeline.pkl')
 
 def print_f2score(model, text):
 
@@ -126,5 +112,5 @@ def print_f2score(model, text):
     print(text)
     print(f'max F2 = {max_f1:.3f}, threshold = {arg_f1 / 100}')
 
-print_f2score(model, "new model:\n")
-print_f2score(orig_model, "original model:\n")
+print_f2score(model, "new model:")
+print_f2score(orig_model, "original model:")

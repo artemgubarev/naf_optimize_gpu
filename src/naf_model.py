@@ -1,11 +1,13 @@
 import numpy as np
 from base import AttentionForest
 from forests import FORESTS, ForestKind, ForestType, TaskType
+from torch.cuda.amp import autocast, GradScaler
 from typing import Optional, Tuple, Union, Callable
 from dataclasses import InitVar, dataclass, field
 import logging
+import joblib
+import os
 
-# from time import time
 import time
 from numba import njit
 from tqdm import tqdm, trange
@@ -16,8 +18,9 @@ from sklearn.utils.validation import check_random_state
 from torch.utils.data import TensorDataset, DataLoader
 
 from IPython.core.debugger import set_trace
-import logging
 
+import logging
+logging.getLogger('numba').setLevel(logging.WARNING)
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
 logging.basicConfig(level=logging.DEBUG, format="%(message)s", force=True)
@@ -116,30 +119,29 @@ class NeuralAttentionForest(AttentionForest):
         forest_cls = FORESTS[ForestType(self.params.kind, self.params.task)]
         self.forest = forest_cls(**self.params.forest)
         self.forest.random_state = self.params.random_state
-        logging.debug("Start fitting Random forest")
-        start_time = time.time()
+        #logging.debug("Start fitting Random forest")
+        #start_time = time.time()
         self.forest.fit(X, y)
-        end_time = time.time()
-        logging.info("Random forest fit time: %f", end_time - start_time)
+        #end_time = time.time()
+        #logging.info("Random forest fit time: %f", end_time - start_time)
         # store training X and y
         self.training_xs = X.copy()
         self.training_y = self._preprocess_target(y.copy())
         # store leaf id for each point in X
-        start_time = time.time()
+        #start_time = time.time()
         self.training_leaf_ids = self.forest.apply(self.training_xs)
-        end_time = time.time()
-        logging.info("Random forest apply time: %f", end_time - start_time)
+        #end_time = time.time()
+        #logging.info("Random forest apply time: %f", end_time - start_time)
         # make a tree-leaf-points correspondence
-        logging.debug("Generating leaves data")
-        start_time = time.time()
-
+        #logging.debug("Generating leaves data")
+        #start_time = time.time()
         self.leaf_sparse = _prepare_leaf_sparse(
             self.training_xs, self.training_leaf_ids
         )
-        end_time = time.time()
-        logging.info("Leaf generation time: %f", end_time - start_time)
+        #end_time = time.time()
+        #logging.info("Leaf generation time: %f", end_time - start_time)
         # self.tree_weights = np.ones(self.forest.n_estimators)
-        logging.debug("Initializing the neural network")
+        #logging.debug("Initializing the neural network")
         self.n_trees = self.forest.n_estimators
         self._make_nn(n_features=X.shape[1])
         return self
@@ -147,7 +149,7 @@ class NeuralAttentionForest(AttentionForest):
     def fit(self, x, y):
         self._base_fit(x, y)
 
-    def optimize_weights(self, X, y_orig) -> "NeuralAttentionForest":
+    def optimize_weights(self, X, y_orig, batch_size=2048, background_batch_size=1024) -> "NeuralAttentionForest":
         assert self.forest is not None, "Need to fit before weights optimization"
 
         if self.params.gpu and torch.cuda.is_available():
@@ -157,18 +159,11 @@ class NeuralAttentionForest(AttentionForest):
             self.device = torch.device("cpu")
         
         if self.params.mode == "end_to_end":
-            self._optimize_weights_end_to_end(X, y_orig)
+            self._optimize_weights_end_to_end(X, y_orig, batch_size, background_batch_size)
         elif self.params.mode == "two_step":
             self._optimize_weights_two_step(X, y_orig)
         else:
             raise ValueError(f"Wrong mode: {self.params.mode!r}")
-
-    # def _make_loss(self):
-    #     if callable(self.params.loss):
-    #         return self.params.loss
-    #     elif self.params.loss == 'mse':
-    #         return torch.nn.MSELoss()
-    #     raise ValueError(f'Wrong loss: {self.params.loss!r}')
 
     def _make_loss(self):
         if callable(self.params.loss):
@@ -183,30 +178,21 @@ class NeuralAttentionForest(AttentionForest):
             return torch.nn.MSELoss()
         else:
             raise ValueError(f"Unsupported loss setting: {self.params.loss!r}")
+        
 
-    def _optimize_weights_end_to_end(self, X, y_orig) -> 'NeuralAttentionForest':
+    def _optimize_weights_end_to_end(self, X, y_orig, batch_size=2048, background_batch_size=1024) -> 'NeuralAttentionForest':
         import gc
         from tqdm import trange
         import matplotlib.pyplot as plt
         assert self.forest is not None, "Need to fit before weights optimization"
         
-        logging.debug(self.device)
-        logging.debug(0)
-        set_trace()
-    
         # device, precision
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         use_fp16 = getattr(self.params, 'use_fp16', False)
         dtype = torch.float16 if use_fp16 else torch.float32
         self.nn = self.nn.to(device).to(dtype)
-    
-        # input data
-        neighbors_hot_cpu = self._get_leaf_data_segments_gpu(X, exclude_input=True, sample_batch_size = 2048, background_batch_size = 4096)
         
         X_tensor = torch.tensor(X, dtype=dtype)
-        
-        logging.debug(2)
-        set_trace()
         
         if self.params.task == TaskType.CLASSIFICATION:
             y_tensor = torch.tensor(y_orig, dtype=torch.long)
@@ -215,15 +201,9 @@ class NeuralAttentionForest(AttentionForest):
             
         indices = torch.arange(X.shape[0])
         
-        logging.debug(3)
-        set_trace()
-        
         # dataloader
         dataset = TensorDataset(X_tensor, y_tensor, indices)
-        loader = DataLoader(dataset, batch_size=1024, shuffle=True)
-        
-        logging.debug(4)
-        set_trace()
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         
         # background data
         dense_y = self.training_y.toarray() if scipy.sparse.issparse(self.training_y) else self.training_y
@@ -231,10 +211,6 @@ class NeuralAttentionForest(AttentionForest):
         background_y_cpu = torch.tensor(dense_y, dtype=dtype)
         if background_y_cpu.ndim == 1:
             background_y_cpu = background_y_cpu.unsqueeze(1)
-        neighbors_hot_cpu = torch.tensor(neighbors_hot_cpu, dtype=torch.bool)
-        
-        logging.debug(5)
-        set_trace()
         
         # loss function
         optim = torch.optim.AdamW(self.nn.parameters(), lr=self.params.lr)
@@ -245,65 +221,74 @@ class NeuralAttentionForest(AttentionForest):
             y_tensor = y_tensor.long()
 
         losses_per_epoch = []
-        background_batch_size = 512
-        
-        logging.debug(6)
-        set_trace()
+        background_batch_size = background_batch_size
 
         # learn
         if self.params.lam == 0.0:
             for epoch in trange(n_epochs, desc="Training (no reconstruction)"):
                 epoch_losses = []
+                
                 for batch_x, batch_y, batch_idx in loader:
                     batch_x = batch_x.to(device).to(dtype)
                     batch_y = batch_y.to(device)
 
-                    # random context
                     idx = torch.randint(0, background_X_cpu.size(0), (background_batch_size,))
                     background_X = background_X_cpu[idx].to(device)
                     background_y = background_y_cpu[idx].to(device)
-                    neighbors_hot = neighbors_hot_cpu[batch_idx][:, idx].to(device)
 
-                    predictions = self.nn(batch_x, background_X, background_y, neighbors_hot)
+                    X_batch_np = X[batch_idx.cpu().numpy()]
+                    seg_batch = self._get_leaf_data_segments_gpu(
+                        X_batch_np,
+                        exclude_input=True,
+                        sample_batch_size=X_batch_np.shape[0],
+                        background_batch_size=background_batch_size,
+                        device=device
+                    )
+                    seg_batch = torch.tensor(seg_batch, dtype=torch.bool, device=device)
+                    neighbors_hot_batch = seg_batch[:, idx, :]
+
+                    predictions = self.nn(batch_x, background_X, background_y, neighbors_hot_batch)
+                
                     optim.zero_grad()
                     loss = loss_fn(predictions, batch_y)
                     loss.backward()
                     optim.step()
                     epoch_losses.append(loss.item())
 
-                    # clean memory
+                    # clean memory TODO: выбрать способ по лучше чистить память
                     torch.cuda.empty_cache()
                     gc.collect()
 
                 losses_per_epoch.append(np.mean(epoch_losses))
-        else:
-            tlw = self.params.target_loss_weight
-            lam = self.params.lam
-            for epoch in trange(n_epochs, desc="Training (with reconstruction)"):
-                epoch_losses = []
-                for batch_x, batch_y, batch_idx in loader:
-                    batch_x = batch_x.to(device).to(dtype)
-                    batch_y = batch_y.to(device)
+        # else:
+        #     tlw = self.params.target_loss_weight
+        #     lam = self.params.lam
+        #     for epoch in trange(n_epochs, desc="Training (with reconstruction)"):
+        #         epoch_losses = []
+        #         for batch_x, batch_y, batch_idx in loader:
+        #             batch_x = batch_x.to(device).to(dtype)
+        #             batch_y = batch_y.to(device)
 
-                    idx = torch.randint(0, background_X_cpu.size(0), (background_batch_size,))
-                    background_X = background_X_cpu[idx].to(device)
-                    background_y = background_y_cpu[idx].to(device)
-                    neighbors_hot = neighbors_hot_cpu[batch_idx][:, idx].to(device)
+        #             idx = torch.randint(0, background_X_cpu.size(0), (background_batch_size,))
+        #             background_X = background_X_cpu[idx].to(device)
+        #             background_y = background_y_cpu[idx].to(device)
+                    
+        #             neighbors_hot_batch = neighbors_hot[batch_idx][:, idx, :].to(device)
 
-                    predictions, xs_reconstruction, *_ = self.nn(
-                        batch_x, background_X, background_y, neighbors_hot, need_attention_weights=True
-                    )
-                    optim.zero_grad()
-                    loss = tlw * loss_fn(predictions, batch_y) + lam * loss_fn(xs_reconstruction, batch_x)
-                    loss.backward()
-                    optim.step()
-                    epoch_losses.append(loss.item())
+        #             predictions, xs_reconstruction, *_ = self.nn(
+        #                 batch_x, background_X, background_y,  neighbors_hot_batch, need_attention_weights=True
+        #             )
+        #             optim.zero_grad()
+        #             loss = tlw * loss_fn(predictions, batch_y) + lam * loss_fn(xs_reconstruction, batch_x)
+        #             loss.backward()
+        #             optim.step()
+        #             epoch_losses.append(loss.item())
 
-                    # clean memory
-                    torch.cuda.empty_cache()
-                    gc.collect()
+        #             # clean memory
+        #             torch.cuda.empty_cache()
+        #             gc.collect()
 
-                losses_per_epoch.append(np.mean(epoch_losses))
+        #         losses_per_epoch.append(np.mean(epoch_losses))
 
         # loss visualizatiopn
         plt.figure(figsize=(8, 5))
@@ -317,6 +302,124 @@ class NeuralAttentionForest(AttentionForest):
         plt.show()
 
         return self
+    
+    
+    # def _optimize_weights_end_to_end(self, X, y_orig, batch_size=2048, background_batch_size=1024) -> 'NeuralAttentionForest':
+    #     import gc
+    #     from tqdm import trange
+    #     import matplotlib.pyplot as plt
+
+    #     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    #     use_fp16 = getattr(self.params, 'use_fp16', False)
+    #     dtype = torch.float16 if use_fp16 else torch.float32
+
+    #     self.nn = self.nn.to(device).to(dtype)
+    #     self.nn.train()
+    #     scaler = GradScaler(enabled=use_fp16)
+
+    #     X_tensor = torch.tensor(X, dtype=dtype, device=device)
+    #     if self.params.task == TaskType.CLASSIFICATION:
+    #         y_tensor = torch.tensor(y_orig, dtype=torch.long, device=device)
+    #     else:
+    #         y_tensor = torch.tensor(
+    #             y_orig[:, None] if y_orig.ndim == 1 else y_orig,
+    #             dtype=torch.float32,
+    #             device=device
+    #         )
+    #     indices = torch.arange(X.shape[0], device=device)
+    #     loader = DataLoader(
+    #         TensorDataset(X_tensor, y_tensor, indices),
+    #         batch_size=batch_size,
+    #         shuffle=True,
+    #         pin_memory=True,
+    #         num_workers=4
+    #     )
+
+    #     dense_y = self.training_y.toarray() if scipy.sparse.issparse(self.training_y) else self.training_y
+    #     background_X_gpu = torch.tensor(self.training_xs, dtype=dtype, device=device)
+    #     background_y_gpu = torch.tensor(dense_y, dtype=dtype, device=device)
+    #     if background_y_gpu.ndim == 1:
+    #         background_y_gpu = background_y_gpu.unsqueeze(1)
+
+    #     optim = torch.optim.AdamW(self.nn.parameters(), lr=self.params.lr)
+    #     loss_fn = self._make_loss()
+    #     n_epochs = self.params.n_epochs
+    #     losses_per_epoch = []
+
+    #     for epoch in trange(n_epochs, desc="Train E2E"):
+    #         epoch_losses = []
+    #         for batch_x, batch_y, batch_idx in loader:
+                
+    #             bg_idx = torch.randint(0, background_X_gpu.size(0), (background_batch_size,), device=device)
+    #             bg_X = background_X_gpu[bg_idx]
+    #             bg_y = background_y_gpu[bg_idx]
+
+    #             leaf_ids_batch = self.forest.apply(X[batch_idx.cpu().numpy()])
+    #             seg_batch = self._compute_seg_for_batch(
+    #                 leaf_ids_batch, 
+    #                 exclude_input=True, 
+    #                 background_batch_size=background_batch_size
+    #             )
+    #             neighbors_hot_batch = seg_batch
+                
+    #             optim.zero_grad()
+    #             with autocast(enabled=use_fp16):
+    #                 preds = self.nn(batch_x, bg_X, bg_y, neighbors_hot_batch)
+    #                 loss = loss_fn(preds, batch_y)
+    #             scaler.scale(loss).backward()
+    #             scaler.step(optim)
+    #             scaler.update()
+
+    #             epoch_losses.append(loss.item())
+
+    #         losses_per_epoch.append(sum(epoch_losses) / len(epoch_losses))
+
+    #         gc.collect()
+            
+    #     plt.figure(figsize=(8, 5))
+    #     plt.plot(losses_per_epoch, label='Loss per epoch')
+    #     plt.xlabel('Epoch')
+    #     plt.ylabel('Loss')
+    #     plt.title('Training Loss Curve')
+    #     plt.grid(True)
+    #     plt.legend()
+    #     plt.tight_layout()
+    #     plt.show()
+    #     return self
+    
+    def _compute_seg_for_batch(
+        self,
+        leaf_ids_batch: np.ndarray,
+        batch_idx: np.ndarray,
+        exclude_input: bool,
+        background_batch_size: int
+    ) -> torch.Tensor:
+        
+        device = self.leaf_sparse_gpu.device
+        leaf_ids = torch.from_numpy(leaf_ids_batch).long().to(device)  # (B, n_trees)
+        n_trees = leaf_ids.shape[1]
+        ls = self.leaf_sparse_gpu                                     # (n_background, n_trees, n_leaves)
+
+    # Собираем сегменты по деревьям
+        segs = []
+        for t in range(n_trees):
+            leaf_idx_t = leaf_ids[:, t]                               # (B,)
+        # ls[:, t, :] — (n_background, n_leaves)
+        # выберем по dim=1 листья у всех background для каждого из B
+            seg_t = ls[:, t, :].index_select(1, leaf_idx_t)           # (n_background, B)
+            segs.append(seg_t.T)                                      # (B, n_background)
+
+        seg = torch.stack(segs, dim=2).bool()                         # (B, n_background, n_trees)
+
+        if exclude_input:
+        # для каждого i обнуляем self-input, если batch_idx[i] < n_background
+            for i, global_i in enumerate(batch_idx):
+                if global_i < seg.shape[1]:
+                    seg[i, global_i, :] = False
+
+    # Случайно выбираем background_batch_size колонок
+        bg_idx = torch.randperm(seg.shape[1], device=device)[:background_batch_size]
+        return seg[:, bg_idx, :]
 
     def _optimize_weights_two_step(self, X, y_orig) -> "NeuralAttentionForest":
         assert self.forest is not None, "Need to fit before weights optimization"
@@ -415,11 +518,9 @@ class NeuralAttentionForest(AttentionForest):
     def _get_leaf_data_segments_gpu(self,
                                 X: np.ndarray,
                                 exclude_input: bool = False,
-                                sample_batch_size: int = 128,
-                                background_batch_size: int = 256,
+                                sample_batch_size: int = 512,
+                                background_batch_size: int = 512,
                                 device: str = 'cuda') -> np.ndarray:
-        
-        from tqdm import tqdm
         
         leaf_ids = self.forest.apply(X)  # shape (n_samples, n_trees)
         n_samples, n_trees = leaf_ids.shape
@@ -427,10 +528,7 @@ class NeuralAttentionForest(AttentionForest):
         
         result = np.zeros((n_samples, n_background, n_trees), dtype=np.uint8)
         
-        logging.debug(1.2)
-        set_trace()
-
-        for si in tqdm(range(0, n_samples, sample_batch_size), 'leafs'):
+        for si in range(0, n_samples, sample_batch_size):
             sb = min(sample_batch_size, n_samples - si)
             leaf_ids_batch = torch.from_numpy(leaf_ids[si:si + sb])  # (sb, n_trees)
 
@@ -455,109 +553,161 @@ class NeuralAttentionForest(AttentionForest):
                 except RuntimeError as e:
                     err_str = str(e)
                     mem_summary = torch.cuda.memory_summary(device=device, abbreviated=True)
-                    with open('/tmp/cuda_crash_log.txt', 'w') as f:
-                        f.write(f"Crash at si={si}, bi={bi}\n")
-                        f.write(err_str + "\n\n")
-                        f.write("=== Memory summary ===\n")
-                        f.write(mem_summary)
+                    print(f"Crash at si={si}, bi={bi}\n")
+                    print(err_str + "\n\n")
+                    print("=== Memory summary ===\n")
+                    print(mem_summary)
                     raise
                 
-        logging.debug(1.3)
-        set_trace()
-            
         return result
     
-    
-    def _get_leaf_data_segments(self, X, exclude_input=False) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Args:
-            X: Input points.
-            exclude_input: Exclude leaf points that are exactly the same as input point.
-                           It is useful to unbias training when fitting and optimizing
-                           on the same data set.
-        """
-        leaf_ids = self.forest.apply(X)
-        # shape of leaf_ids: (n_samples, n_trees)
-        result = np.zeros((X.shape[0], self.leaf_sparse.shape[0], self.leaf_sparse.shape[1]), dtype=np.uint8)
-        # shape of `self.leaf_sparse`: (n_background_samples, n_trees, n_leaves)
-        for i in range(leaf_ids.shape[0]):
-            for j in range(leaf_ids.shape[1]):
-                result[i, :, j] = self.leaf_sparse[:, j, leaf_ids[i, j]]
-            if exclude_input:
-                result[i, i, :] = 0
-        # result shape: (n_samples, n_background_samples, n_trees)
-        return result
+
         
 
-    def predict(self, X, need_attention_weights=False, batch_size=128) -> np.ndarray:
-        from tqdm import tqdm
+    # def predict(self, X, need_attention_weights=False) -> np.ndarray:
+    #     assert self.forest is not None, "Need to fit before predict"
+        
+    #     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+    #     neighbors_hot = self._get_leaf_data_segments_gpu(X, exclude_input=False)
+    #     X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+    #     background_X = torch.tensor(self.training_xs, dtype=torch.float32).to(device)
+        
+    #     if scipy.sparse.issparse(self.training_y):
+    #         background_y_np = self.training_y.toarray()
+    #     else:
+    #         background_y_np = self.training_y
+    #     background_y = torch.tensor(background_y_np, dtype=torch.float32).to(device)
+        
+    #     if len(background_y.shape) == 1:
+    #         background_y = background_y.unsqueeze(1)
+    #     neighbors_hot = torch.tensor(neighbors_hot, dtype=torch.bool).to(device)
+        
+    #     self.nn = self.nn.to(device)
+        
+    #     with torch.no_grad():
+    #         output = self.nn(
+    #             X_tensor,
+    #             background_X,
+    #             background_y,
+    #             neighbors_hot,
+    #             need_attention_weights=need_attention_weights,
+    #         )
+    #         if isinstance(output, tuple):
+    #             output = tuple([
+    #                 out.detach().cpu().numpy()
+    #                 for out in output
+    #             ])
+    #             predictions, X_reconstruction, alphas, betas = output
+    #         else:
+    #             predictions = output.detach().cpu().numpy()
 
+    #     if self.params.kind.need_add_init():
+    #         predictions += self.forest.init_.predict(X)[:, np.newaxis]
+    #     if not need_attention_weights:
+    #         return predictions
+    #     else:
+    #         return predictions, X_reconstruction, alphas, betas
+    
+    def predict(self, X, need_attention_weights=False, batch_size=256) -> np.ndarray:
         assert self.forest is not None, "Need to fit before predict"
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.nn = self.nn.to(device).float()
+        
+        neighbors_hot_full = self._get_leaf_data_segments_gpu(X, exclude_input=False)
+        neighbors_hot_full = torch.tensor(neighbors_hot_full, dtype=torch.bool)
 
-        # Background (оставляем на CPU)
-        neighbors_hot_all = torch.tensor(
-            self._get_leaf_data_segments(X, exclude_input=False), dtype=torch.bool
-        )  # (n_samples, n_background, n_trees)
+        background_X = torch.tensor(self.training_xs, dtype=torch.float32).to(device)
 
-        dense_y = (
-            self.training_y.toarray()
-            if scipy.sparse.issparse(self.training_y)
-            else self.training_y
-        )
-        background_X_full = torch.tensor(self.training_xs, dtype=torch.float)
-        background_y_full = torch.tensor(dense_y, dtype=torch.float)
-        if background_y_full.ndim == 1:
-            background_y_full = background_y_full.unsqueeze(1)
+        if scipy.sparse.issparse(self.training_y):
+            background_y_np = self.training_y.toarray()
+        else:
+            background_y_np = self.training_y
+        background_y = torch.tensor(background_y_np, dtype=torch.float32).to(device)
+        if background_y.ndim == 1:
+            background_y = background_y.unsqueeze(1)
 
-        # Ограничим размер background для предсказания
-        background_sample_idx = torch.randperm(background_X_full.size(0))[
-            :256
-        ]  # <= адаптируй под VRAM
-        background_X = background_X_full[background_sample_idx].to(device)
-        background_y = background_y_full[background_sample_idx].to(device)
+        self.nn = self.nn.to(device)
 
-        results = []
+        predictions_all = []
+        if need_attention_weights:
+            x_recon_all, alphas_all, betas_all = [], [], []
 
-        for i in tqdm(range(0, len(X), batch_size), desc="Predicting"):
-            x_batch = X[i : i + batch_size]
-            neighbors_hot_batch = neighbors_hot_all[i : i + batch_size][
-                :, background_sample_idx
-            ]  # (batch, background, trees)
+        for i in tqdm(range(0, len(X), batch_size), 'predict'):
+            xb = X[i:i + batch_size]
+            nb_full = neighbors_hot_full[i:i + batch_size]  
 
-            X_tensor = torch.tensor(x_batch, dtype=torch.float, device=device)
-            neighbors_hot = neighbors_hot_batch.to(device)
+            xb_tensor = torch.tensor(xb, dtype=torch.float32).to(device)
+            bg_idx = torch.randperm(nb_full.shape[1])[:256]
+            background_X_batch = background_X[bg_idx]
+            background_y_batch = background_y[bg_idx]
+            nb_tensor = nb_full[:, bg_idx, :].to(device)
 
             with torch.no_grad():
                 output = self.nn(
-                    X_tensor,
-                    background_X,
-                    background_y,
-                    neighbors_hot,
+                    xb_tensor,
+                    background_X_batch,
+                    background_y_batch,
+                    nb_tensor,
                     need_attention_weights=need_attention_weights,
                 )
+                if isinstance(output, tuple):
+                    preds, x_recon, alphas, betas = output
+                    predictions_all.append(preds.cpu())
+                    x_recon_all.append(x_recon.cpu())
+                    alphas_all.append(alphas.cpu())
+                    betas_all.append(betas.cpu())
+                else:
+                    predictions_all.append(output.cpu())
 
-            if isinstance(output, tuple):
-                output = tuple(out.detach().cpu().numpy() for out in output)
-                predictions, X_reconstruction, alphas, betas = output
-                results.append((predictions, X_reconstruction, alphas, betas))
-            else:
-                predictions = output.detach().cpu().numpy()
-                results.append(predictions)
-
-        if need_attention_weights:
-            preds, recons, alphas, betas = zip(*results)
-            predictions = np.vstack(preds)
-            X_reconstruction = np.vstack(recons)
-            alphas = np.vstack(alphas)
-            betas = np.vstack(betas)
-            return predictions, X_reconstruction, alphas, betas
-        else:
-            predictions = np.vstack(results)
+        predictions = torch.cat(predictions_all, dim=0).numpy()
 
         if self.params.kind.need_add_init():
             predictions += self.forest.init_.predict(X)[:, np.newaxis]
 
-        return predictions
+        if not need_attention_weights:
+            return predictions
+        else:
+            return (
+                predictions,
+                torch.cat(x_recon_all, dim=0).numpy(),
+                torch.cat(alphas_all, dim=0).numpy(),
+                torch.cat(betas_all, dim=0).numpy(),
+            )
+
+    def save(self, path: str):
+        os.makedirs(path, exist_ok=True)
+        torch.save(self.nn.state_dict(), os.path.join(path, "nn_weights.pth"))
+        joblib.dump(self.forest, os.path.join(path, "forest.pkl"))
+        joblib.dump(self.params, os.path.join(path, "params.pkl"))
+        np.save(os.path.join(path, "training_xs.npy"), self.training_xs)
+        y = self.training_y.toarray() if scipy.sparse.issparse(self.training_y) else self.training_y
+        np.save(os.path.join(path, "training_y.npy"), y)
+        np.save(os.path.join(path, "leaf_sparse.npy"), self.leaf_sparse)
+        
+    def load(self, n_features, path: str):
+        self.forest = joblib.load(os.path.join(path, "forest.pkl"))
+        self.params = joblib.load(os.path.join(path, "params.pkl"))
+        self.training_xs = np.load(os.path.join(path, "training_xs.npy"))
+        self.leaf_sparse = np.load(os.path.join(path, "leaf_sparse.npy"))
+
+        raw_y = np.load(os.path.join(path, "training_y.npy"), allow_pickle=True)
+
+        if raw_y.dtype == object and raw_y.ndim == 0:
+            elem = raw_y.item()
+            if scipy.sparse.isspmatrix(elem):
+                raw_y = elem
+                
+        if scipy.sparse.isspmatrix(raw_y):
+            raw_y = raw_y.toarray()
+
+        self.training_y = np.asarray(raw_y, dtype=np.float32)
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._make_nn(n_features)
+        self.nn.load_state_dict(torch.load(
+            os.path.join(path, "nn_weights.pth"),
+            map_location=device
+        ))
+        self.nn = self.nn.to(device).float()
+        self.nn.eval()
