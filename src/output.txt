@@ -1,0 +1,16 @@
+⏳ start model fit...
+min          = 1
+max          = 102
+std          = 20.86
+median       = 41.0
+unique count = 102
+✅ model fit... 4.39 sec
+⏳ optimize weights...
+mean loss = 0.45553
+mean loss = 0.45426
+mean loss = 0.44353
+mean loss = 0.44595
+✅ optimize weights... 8.51 sec
+⏳ predict...
+✅ predict... 0.80 sec
+max F2 = 0.577, threshold = 0.98

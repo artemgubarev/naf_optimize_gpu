@@ -16,32 +16,48 @@ def print_mem(stage):
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), '..', 'src')))
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), '..', 'src/features')))
 
-import re
-import pytz
-import time
-import joblib
+
+
 import pandas as pd
 import numpy as np
 import warnings
+import time
 
 from tqdm import tqdm
 from datetime import datetime
+
 from sklearn.metrics import fbeta_score
 from sklearn.model_selection import train_test_split
+
 from process_features import preprocess_data
 from forests import ForestKind, TaskType
 from naf_model import NeuralAttentionForest, NAFParams
 
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
 if __name__ == "__main__":
     try:
-        warnings.filterwarnings("default")
+        warnings.filterwarnings("ignore")
+        
+        logfile = open('output.txt', 'w')
+        sys.stdout = Tee(sys.stdout, logfile)
 
+
+        # ----------- load data ---------------
         start_time = time.time()
-
         path = '../../gsoc_incidents_raw3.parquet'
         df = pd.read_parquet(path)
 
-        df['target'] = df['Вердикт'].apply(lambda x: True if x == 'False Positive' else (pd.NA if x == 'Не указан' else False))
+        df['target'] = df['Вердикт'].apply( lambda x: True if x == 'False Positive' else (pd.NA if x == 'Не указан' else False))
         df = df[df['target'].notnull()]
         df['target'] = df['target'].astype(float)
         df = df[::1]
@@ -50,57 +66,55 @@ if __name__ == "__main__":
         X = df.drop(columns=['target'])
 
         used_columns = pd.read_csv('../src/features/used_columns.csv')
-        X = X[used_columns['column'].to_numpy()]
 
+        X = X[used_columns['column'].to_numpy()]
         X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
         X_train = preprocess_data(X_train, '../data/transform_data_pipeline.pkl')
 
-        end_time = time.time()
-        print("✅ data loaded successfully... %.2f sec" % (end_time - start_time))
 
+        # ----------- fit ---------------
         params = NAFParams(
             kind=ForestKind.RANDOM,
             task=TaskType.CLASSIFICATION,
             mode='end_to_end',
             loss='cross_entropy',
-            n_epochs=50,
-            lr=0.01,
+            weights_init_type='general_rule_normal',
+            n_epochs=20,
+            lr=0.001,
             lam=0.0,
             target_loss_weight=1.0,
-            hidden_size=16,
+            hidden_size=128,
             gpu=True,
-            gpu_device=4,
-            n_layers=1,
+            gpu_device = 3,
+            n_layers=4,
+            random_state=67890,
             forest=dict(
-                n_estimators=100,
-                min_samples_leaf=1,
-                n_jobs=-1
-            ),
-            random_state=67890
-        )
+                n_estimators=200,
+                min_samples_leaf=10,
+                n_jobs=-1,
+                max_depth=10,
+                min_samples_split = 4,
+            ))
         model = NeuralAttentionForest(params)
 
-        print_mem("Before model.fit")
         start_time = time.time()
-        print("⏳ model fit...")
+        print("⏳ start model fit...")
         model.fit(X_train, y_train)
         end_time = time.time()
         print("✅ model fit... %.2f sec" % (end_time - start_time))
-        print_mem("After model.fit")
 
-        print_mem("Before optimize_weights")
+        # ----------- optimize weights ---------------
         start_time = time.time()
         print("⏳ optimize weights...")
-        model.optimize_weights(X_train, y_train, batch_size=512, background_batch_size=256)
+        model.optimize_weights(X_train, y_train, batch_size=1024, background_batch_size=512, n_parts=512)
         end_time = time.time()
         print("✅ optimize weights... %.2f sec" % (end_time - start_time))
-        print_mem("After optimize_weights")
 
+        # ----------- predict ---------------
+        start_time = time.time()
+        print("⏳ predict...")
         X_test_proc = preprocess_data(X_test, '../data/transform_data_pipeline.pkl')
-
-        print_mem("Before predict")
-        y_proba = model.predict(X_test_proc)[:, 1]
-        print_mem("After predict")
+        y_proba = model.predict_batch(X_test_proc, batch_size=1024, background_batch_size=512, n_parts=256)[:, 1]
 
         thresholds = np.linspace(0, 1, 100)
         beta = 2
@@ -116,11 +130,13 @@ if __name__ == "__main__":
         max_f1 = f1_scores.max()
         arg_f1 = f1_scores.argmax()
 
-        print(f'max F2 = {max_f1:.3f}, threshold = {arg_f1 / 100}')
+        end_time = time.time()
+        print("✅ predict... %.2f sec" % (end_time - start_time))
 
-        model.save('../models/')
+        print(f'max F2 = {max_f1:.3f}, threshold = {arg_f1 / 100}')
+        
+        logfile.close()
 
     except Exception as e:
         print("\n🔥 EXCEPTION OCCURRED!")
         traceback.print_exc()
-        import pdb; pdb.set_trace()
