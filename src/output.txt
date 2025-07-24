@@ -1,16 +1,33 @@
+(159964, 36)
 ⏳ start model fit...
-min          = 1
-max          = 102
-std          = 20.86
-median       = 41.0
-unique count = 102
-✅ model fit... 4.39 sec
+min          = 3
+max          = 910
+std          = 188.66
+median       = 349.0
+unique count = 903
+✅ model fit... 30.03 sec
 ⏳ optimize weights...
-mean loss = 0.45553
-mean loss = 0.45426
-mean loss = 0.44353
-mean loss = 0.44595
-✅ optimize weights... 8.51 sec
+Epoch 1/20 — mean loss: 0.47943
+Epoch 2/20 — mean loss: 0.46903
+Epoch 3/20 — mean loss: 0.46490
+Epoch 4/20 — mean loss: 0.46332
+Epoch 5/20 — mean loss: 0.46141
+Epoch 6/20 — mean loss: 0.46129
+Epoch 7/20 — mean loss: 0.46024
+Epoch 8/20 — mean loss: 0.46189
+Epoch 9/20 — mean loss: 0.46161
+Epoch 10/20 — mean loss: 0.45830
+Epoch 11/20 — mean loss: 0.45904
+Epoch 12/20 — mean loss: 0.45829
+Epoch 13/20 — mean loss: 0.45773
+Epoch 14/20 — mean loss: 0.45709
+Epoch 15/20 — mean loss: 0.45671
+Epoch 16/20 — mean loss: 0.45608
+Epoch 17/20 — mean loss: 0.45670
+Epoch 18/20 — mean loss: 0.45678
+Epoch 19/20 — mean loss: 0.45566
+Epoch 20/20 — mean loss: 0.45565
+✅ optimize weights... 782.19 sec
 ⏳ predict...
-✅ predict... 0.80 sec
-max F2 = 0.577, threshold = 0.98
+✅ predict... 27.30 sec
+max F2 = 0.624, threshold = 0.98

@@ -70,6 +70,8 @@ if __name__ == "__main__":
         X = X[used_columns['column'].to_numpy()]
         X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
         X_train = preprocess_data(X_train, '../data/transform_data_pipeline.pkl')
+        
+        print(X.shape)
 
 
         # ----------- fit ---------------
@@ -106,7 +108,7 @@ if __name__ == "__main__":
         # ----------- optimize weights ---------------
         start_time = time.time()
         print("⏳ optimize weights...")
-        model.optimize_weights(X_train, y_train, batch_size=1024, background_batch_size=512, n_parts=512)
+        model.optimize_weights(X_train, y_train, batch_size=2048, background_batch_size=1024)
         end_time = time.time()
         print("✅ optimize weights... %.2f sec" % (end_time - start_time))
 
@@ -114,7 +116,7 @@ if __name__ == "__main__":
         start_time = time.time()
         print("⏳ predict...")
         X_test_proc = preprocess_data(X_test, '../data/transform_data_pipeline.pkl')
-        y_proba = model.predict_batch(X_test_proc, batch_size=1024, background_batch_size=512, n_parts=256)[:, 1]
+        y_proba = model.predict_batch(X_test_proc, batch_size=2048, background_batch_size=1024)[:, 1]
 
         thresholds = np.linspace(0, 1, 100)
         beta = 2
